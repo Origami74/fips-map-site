@@ -1,0 +1,27 @@
+{
+  "name": "fips-map-site",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@fontsource-variable/inter": "^5.2.8",
+    "@fontsource-variable/jetbrains-mono": "^5.2.8",
+    "applesauce-core": "^2.3.0",
+    "applesauce-relay": "^2.3.0",
+    "buffer": "^6.0.3",
+    "leaflet": "^1.9.4",
+    "mmdb-lib": "^2.1.1",
+    "nostr-tools": "^2.23.3",
+    "rxjs": "^7.8.1",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "vite": "^6.0.7"
+  }
+}
