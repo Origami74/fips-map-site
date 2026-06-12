@@ -18,15 +18,41 @@ const DB_URL = `${import.meta.env.BASE_URL}dbip-country-lite.mmdb`;
 
 let readerPromise = null;
 
+// Stream the database so callers can show real download progress — the file is
+// ~8 MB, which is a noticeable wait on slow connections. onProgress receives a
+// fraction in [0, 1]; it's only wired up on the first (memoized) call.
+async function fetchArrayBufferWithProgress(url, onProgress) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`geo db ${res.status}`);
+  const total = Number(res.headers.get("content-length")) || 0;
+  // No body stream or unknown length: fall back to a single read (no progress).
+  if (!res.body || !total) return res.arrayBuffer();
+
+  const stream = res.body.getReader();
+  const chunks = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await stream.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    if (onProgress) onProgress(Math.min(1, received / total));
+  }
+  const out = new Uint8Array(received);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.length;
+  }
+  return out.buffer;
+}
+
 // Load + parse the mmdb once; subsequent callers share the same promise.
-export function loadGeoDb() {
+export function loadGeoDb(onProgress) {
   if (!readerPromise) {
-    readerPromise = fetch(DB_URL)
-      .then((res) => {
-        if (!res.ok) throw new Error(`geo db ${res.status}`);
-        return res.arrayBuffer();
-      })
-      .then((ab) => new Reader(Buffer.from(ab)));
+    readerPromise = fetchArrayBufferWithProgress(DB_URL, onProgress).then(
+      (ab) => new Reader(Buffer.from(ab)),
+    );
   }
   return readerPromise;
 }

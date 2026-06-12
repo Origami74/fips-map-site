@@ -13,6 +13,7 @@ const {
   showExpired,
   status,
   errorMsg,
+  nowSec,
   peerList,
   liveCount,
   expiredCount,
@@ -28,6 +29,9 @@ const filtersOpen = ref(false);
 // located-peers computed re-runs once the offline db finishes loading.
 const reader = shallowRef(null);
 const geoStatus = ref("loading geo db…");
+const geoLoading = ref(true);
+const geoProgress = ref(0); // download fraction [0, 1]
+const geoPct = computed(() => Math.round(geoProgress.value * 100));
 
 // Each peer that resolved to a country, carrying its location + advert meta.
 const locatedPeers = computed(() => {
@@ -46,6 +50,18 @@ const unlocatedCount = computed(
   () => peerList.value.length - locatedPeers.value.length,
 );
 
+// Within a country, starred (pinned) nodes first — alphabetically by their
+// pin name — then the rest, newest advert first.
+function compareNodes(a, b) {
+  const pa = a.peer.pin ? 0 : 1;
+  const pb = b.peer.pin ? 0 : 1;
+  if (pa !== pb) return pa - pb;
+  if (a.peer.pin && b.peer.pin) {
+    return (a.peer.pin.name || "").localeCompare(b.peer.pin.name || "");
+  }
+  return b.peer.event.created_at - a.peer.event.created_at;
+}
+
 // Group located peers by country for one marker per country.
 const countryGroups = computed(() => {
   const groups = new Map();
@@ -57,7 +73,15 @@ const countryGroups = computed(() => {
     }
     g.items.push({ peer, loc });
   }
-  return [...groups.values()].sort((a, b) => b.items.length - a.items.length);
+  const list = [...groups.values()];
+  for (const g of list) {
+    g.items.sort(compareNodes);
+    g.pinned = g.items.reduce((n, it) => n + (it.peer.pin ? 1 : 0), 0);
+  }
+  // Countries with starred nodes float to the top, then by peer count.
+  return list.sort(
+    (a, b) => Number(b.pinned > 0) - Number(a.pinned > 0) || b.items.length - a.items.length,
+  );
 });
 
 // Country currently under the cursor (on a map marker or a list row). Drives
@@ -97,48 +121,121 @@ function statusPillClass(s) {
   return "";
 }
 
+// --- Selection (Vue-driven detail panel) ---------------------------------
+// We deliberately do NOT use Leaflet popups: on touch devices the map swallows
+// the tap and closes the popup almost immediately. Driving the panel from Vue
+// state keeps it open until the user dismisses it, and lets a node be selected
+// for its own detail view.
+const selectedCode = ref(null); // country shown in the panel
+const selectedKey = ref(null); // pubkey of the node shown in detail
+const sideEl = ref(null);
+
+const selectedGroup = computed(
+  () => countryGroups.value.find((g) => g.code === selectedCode.value) ?? null,
+);
+const selectedPeer = computed(() => {
+  if (!selectedGroup.value || !selectedKey.value) return null;
+  return (
+    selectedGroup.value.items.find(
+      (it) => it.peer.event.pubkey === selectedKey.value,
+    ) ?? null
+  );
+});
+
+function revealPanelOnMobile() {
+  if (typeof window !== "undefined" && window.innerWidth <= 860) {
+    // Let the DOM update (panel switches view) before scrolling to it.
+    requestAnimationFrame(() => {
+      sideEl.value?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+}
+
+function selectCountry(code, { fly = true } = {}) {
+  selectedCode.value = code;
+  selectedKey.value = null;
+  if (fly) {
+    const marker = markersByCode.get(code);
+    if (marker && map) {
+      map.flyTo(marker.getLatLng(), Math.max(map.getZoom(), 4), {
+        duration: 0.6,
+      });
+    }
+  }
+  revealPanelOnMobile();
+}
+
+function selectPeer(pubkey) {
+  selectedKey.value = pubkey;
+  revealPanelOnMobile();
+}
+
+function clearSelection() {
+  selectedCode.value = null;
+  selectedKey.value = null;
+}
+
+// If the selected country drops out of the live set (rescan, expiry), fall
+// back to the list rather than showing a stale/empty detail view.
+watch(countryGroups, (groups) => {
+  if (selectedCode.value && !groups.some((g) => g.code === selectedCode.value)) {
+    clearSelection();
+  }
+});
+
+// --- Node detail helpers -------------------------------------------------
+function tagValue(ev, name) {
+  const t = ev.tags.find((x) => x[0] === name);
+  return t ? t[1] : null;
+}
+function peerProtocol(peer) {
+  return tagValue(peer.event, "protocol") || "(missing)";
+}
+function peerVersion(peer) {
+  return tagValue(peer.event, "version") || "?";
+}
+function formatUnix(ts) {
+  if (!ts) return null;
+  return new Date(ts * 1000).toISOString().replace("T", " ").replace(".000Z", "Z");
+}
+function relativeTime(ts) {
+  if (!ts) return "";
+  const diff = nowSec.value - ts;
+  const abs = Math.abs(diff);
+  const unit =
+    abs < 60
+      ? `${abs}s`
+      : abs < 3600
+        ? `${Math.floor(abs / 60)}m`
+        : abs < 86400
+          ? `${Math.floor(abs / 3600)}h`
+          : `${Math.floor(abs / 86400)}d`;
+  return diff >= 0 ? `${unit} ago` : `in ${unit}`;
+}
+
+const copiedKey = ref(null);
+async function copyValue(key, value) {
+  try {
+    await navigator.clipboard.writeText(value);
+    copiedKey.value = key;
+    setTimeout(() => {
+      if (copiedKey.value === key) copiedKey.value = null;
+    }, 1200);
+  } catch (_) {
+    // Clipboard API can fail in non-secure contexts; ignore.
+  }
+}
+
 // --- Leaflet map ---------------------------------------------------------
 const mapEl = ref(null);
 let map = null;
 let markerLayer = null;
 const markersByCode = new Map();
 
-function escapeHtml(s) {
-  return String(s).replace(
-    /[&<>"']/g,
-    (c) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
-  );
-}
-
 function badgeTier(count) {
   if (count >= 10) return "lg";
   if (count >= 4) return "md";
   return "sm";
-}
-
-function popupHtml(group) {
-  const rows = group.items
-    .map(({ peer, loc }) => {
-      const star = peer.pin ? '<span class="pop-star">★</span>' : "";
-      const exp = peer.expired ? '<span class="pop-exp">expired</span>' : "";
-      const ep = loc.endpoint
-        ? escapeHtml(`${loc.endpoint.transport}:${loc.endpoint.addr}`)
-        : "";
-      return `<li>${star}<span class="pop-name">${escapeHtml(
-        peerLabel(peer),
-      )}</span>${exp}<span class="pop-ep">${ep}</span></li>`;
-    })
-    .join("");
-  return `<div class="pop">
-    <div class="pop-head">${escapeHtml(group.name)} <span class="pop-code">${escapeHtml(
-      group.code,
-    )}</span></div>
-    <div class="pop-sub">${group.items.length} peer${
-      group.items.length === 1 ? "" : "s"
-    }</div>
-    <ul class="pop-list">${rows}</ul>
-  </div>`;
 }
 
 function renderMarkers() {
@@ -152,11 +249,14 @@ function renderMarkers() {
       html: `<span class="fips-badge ${badgeTier(count)}">${count}</span>`,
       iconSize: [0, 0],
     });
-    const marker = L.marker([group.lat, group.lng], { icon }).bindPopup(
-      popupHtml(group),
-      { className: "fips-popup", maxWidth: 320 },
-    );
+    const marker = L.marker([group.lat, group.lng], {
+      icon,
+      // Larger touch target so taps land reliably on mobile.
+      riseOnHover: true,
+    });
     const code = group.code;
+    // Tap/click selects the country into the Vue panel (no Leaflet popup).
+    marker.on("click", () => selectCountry(code, { fly: false }));
     marker.on("mouseover", () => {
       hoveredCode.value = code;
     });
@@ -179,10 +279,7 @@ function syncMarkerHighlight() {
 }
 
 function focusCountry(code) {
-  const marker = markersByCode.get(code);
-  if (!marker || !map) return;
-  map.flyTo(marker.getLatLng(), Math.max(map.getZoom(), 4), { duration: 0.6 });
-  marker.openPopup();
+  selectCountry(code);
 }
 
 onMounted(async () => {
@@ -208,10 +305,14 @@ onMounted(async () => {
   scan();
 
   try {
-    reader.value = await loadGeoDb();
+    reader.value = await loadGeoDb((frac) => {
+      geoProgress.value = frac;
+    });
     geoStatus.value = "geo db ready";
   } catch (e) {
     geoStatus.value = "geo db failed: " + (e?.message || String(e));
+  } finally {
+    geoLoading.value = false;
   }
 });
 
@@ -402,41 +503,186 @@ onBeforeUnmount(() => {
               <span class="legend-dot" /> peer count per country ·
               <span class="muted">country-level (approximate)</span>
             </div>
+
+            <!-- Geo DB download overlay. The ~8 MB database must arrive before
+                 any peer can be placed, so we keep the map masked until it's
+                 ready and show real progress. -->
+            <div v-if="geoLoading" class="map-loading">
+              <div class="loading-card">
+                <span class="spinner" aria-hidden="true" />
+                <p class="loading-title">Loading geolocation database…</p>
+                <div class="progress-track">
+                  <div class="progress-bar" :style="{ width: geoPct + '%' }" />
+                </div>
+                <p class="loading-sub">
+                  {{ geoPct }}% · ~8 MB offline database — this may take a while
+                  on slow connections (cached after the first load).
+                </p>
+              </div>
+            </div>
           </div>
 
-          <aside class="side">
-            <div class="side-head">
-              <span class="eyebrow">countries</span>
-              <span class="side-count">{{ countryGroups.length }}</span>
+          <aside ref="sideEl" class="side">
+            <!-- Loading -->
+            <div v-if="geoLoading" class="side-empty">
+              <span class="spinner small" aria-hidden="true" />
+              <p>Loading geolocation database… {{ geoPct }}%</p>
             </div>
-            <ul v-if="countryGroups.length" class="country-list">
-              <li
-                v-for="g in displayGroups"
-                :key="g.code"
-                class="country-row"
-                :class="{ 'is-hovered': g.code === hoveredCode }"
-                @click="focusCountry(g.code)"
-                @mouseenter="hoveredCode = g.code"
-                @mouseleave="hoveredCode = null"
-              >
-                <span class="country-name">
-                  <span class="country-code">{{ g.code }}</span>
-                  {{ g.name }}
-                </span>
-                <span class="country-count">{{ g.items.length }}</span>
-              </li>
-            </ul>
-            <div v-else class="side-empty">
-              <p>{{ geoStatus }}</p>
-              <p v-if="reader" class="muted">
-                No peers placed yet. Adverts are still arriving, or live peers
-                only expose NAT/onion endpoints.
+
+            <!-- Node detail -->
+            <template v-else-if="selectedPeer">
+              <div class="side-head detail-head">
+                <button
+                  class="back-btn"
+                  @click="selectedKey = null"
+                  aria-label="Back to country"
+                >
+                  ‹ {{ selectedGroup.name }}
+                </button>
+              </div>
+              <div class="node-detail">
+                <div class="node-title">
+                  <span v-if="selectedPeer.peer.pin" class="pin-star">★</span>
+                  <span class="node-name">{{ peerLabel(selectedPeer.peer) }}</span>
+                  <span
+                    class="dot"
+                    :class="{ off: selectedPeer.peer.expired }"
+                    :title="selectedPeer.peer.expired ? 'expired' : 'live'"
+                  />
+                </div>
+
+                <dl class="kv">
+                  <dt>country</dt>
+                  <dd>{{ selectedPeer.loc.name }} ({{ selectedPeer.loc.code }})</dd>
+
+                  <dt>protocol</dt>
+                  <dd>
+                    {{ peerProtocol(selectedPeer.peer) }}
+                    <span class="muted">v{{ peerVersion(selectedPeer.peer) }}</span>
+                  </dd>
+
+                  <dt>endpoints</dt>
+                  <dd>
+                    <div
+                      v-for="e in selectedPeer.peer.advert?.endpoints || []"
+                      :key="`${e.transport}:${e.addr}`"
+                      class="ep-row"
+                    >
+                      <span class="mono">{{ e.transport }}:{{ e.addr }}</span>
+                      <button
+                        class="copy-btn"
+                        @click="copyValue(`ep:${e.addr}`, `${e.transport}:${e.addr}`)"
+                      >
+                        {{ copiedKey === `ep:${e.addr}` ? "✓" : "copy" }}
+                      </button>
+                    </div>
+                    <span
+                      v-if="!(selectedPeer.peer.advert?.endpoints || []).length"
+                      class="muted"
+                      >none</span
+                    >
+                  </dd>
+
+                  <dt>npub</dt>
+                  <dd class="wrap">
+                    <span class="mono small">{{ npubFor(selectedPeer.peer.event.pubkey) }}</span>
+                    <button
+                      class="copy-btn"
+                      @click="copyValue('npub', npubFor(selectedPeer.peer.event.pubkey))"
+                    >
+                      {{ copiedKey === "npub" ? "✓" : "copy" }}
+                    </button>
+                  </dd>
+
+                  <dt>pubkey</dt>
+                  <dd class="wrap">
+                    <span class="mono small muted">{{ selectedPeer.peer.event.pubkey }}</span>
+                    <button
+                      class="copy-btn"
+                      @click="copyValue('hex', selectedPeer.peer.event.pubkey)"
+                    >
+                      {{ copiedKey === "hex" ? "✓" : "copy" }}
+                    </button>
+                  </dd>
+
+                  <dt>last seen</dt>
+                  <dd>
+                    {{ relativeTime(selectedPeer.peer.event.created_at) }}
+                    <span class="muted small">{{ formatUnix(selectedPeer.peer.event.created_at) }}</span>
+                  </dd>
+                </dl>
+              </div>
+            </template>
+
+            <!-- Country detail: list of nodes -->
+            <template v-else-if="selectedGroup">
+              <div class="side-head detail-head">
+                <button
+                  class="back-btn"
+                  @click="clearSelection"
+                  aria-label="Back to all countries"
+                >
+                  ‹ all countries
+                </button>
+                <span class="side-count">{{ selectedGroup.items.length }}</span>
+              </div>
+              <div class="detail-country">
+                <span class="country-code">{{ selectedGroup.code }}</span>
+                {{ selectedGroup.name }}
+              </div>
+              <ul class="node-list">
+                <li
+                  v-for="it in selectedGroup.items"
+                  :key="it.peer.event.pubkey"
+                  class="node-row"
+                  @click="selectPeer(it.peer.event.pubkey)"
+                >
+                  <span class="node-row-main">
+                    <span v-if="it.peer.pin" class="pin-star">★</span>
+                    <span class="node-name">{{ peerLabel(it.peer) }}</span>
+                    <span class="tag accent-red" v-if="it.peer.expired">expired</span>
+                  </span>
+                  <span class="node-ep mono">{{ it.loc.endpoint.transport }}:{{ it.loc.endpoint.addr }}</span>
+                </li>
+              </ul>
+            </template>
+
+            <!-- Country list (default) -->
+            <template v-else>
+              <div class="side-head">
+                <span class="eyebrow">countries</span>
+                <span class="side-count">{{ countryGroups.length }}</span>
+              </div>
+              <ul v-if="countryGroups.length" class="country-list">
+                <li
+                  v-for="g in displayGroups"
+                  :key="g.code"
+                  class="country-row"
+                  :class="{ 'is-hovered': g.code === hoveredCode }"
+                  @click="selectCountry(g.code)"
+                  @mouseenter="hoveredCode = g.code"
+                  @mouseleave="hoveredCode = null"
+                >
+                  <span class="country-name">
+                    <span v-if="g.pinned" class="pin-star" title="has recommended node">★</span>
+                    <span class="country-code">{{ g.code }}</span>
+                    {{ g.name }}
+                  </span>
+                  <span class="country-count">{{ g.items.length }}</span>
+                </li>
+              </ul>
+              <div v-else class="side-empty">
+                <p>{{ geoStatus }}</p>
+                <p v-if="reader" class="muted">
+                  No peers placed yet. Adverts are still arriving, or live peers
+                  only expose NAT/onion endpoints.
+                </p>
+              </div>
+              <p v-if="unlocatedCount > 0 && reader" class="side-note">
+                {{ unlocatedCount }} live peer{{ unlocatedCount === 1 ? "" : "s" }}
+                not shown (NAT-only, onion, or unrecognized address).
               </p>
-            </div>
-            <p v-if="unlocatedCount > 0 && reader" class="side-note">
-              {{ unlocatedCount }} live peer{{ unlocatedCount === 1 ? "" : "s" }}
-              not shown (NAT-only, onion, or unrecognized address).
-            </p>
+            </template>
           </aside>
         </div>
 
@@ -904,6 +1150,231 @@ button.tiny {
   font-size: 0.6875rem;
   color: var(--text-muted);
   line-height: 1.45;
+}
+
+/* Map loading overlay --------------------------------------------------- */
+.map-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 10, 18, 0.82);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+.loading-card {
+  width: min(360px, 86%);
+  text-align: center;
+  padding: var(--space-lg);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--bg-surface);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.loading-title {
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  color: var(--text-primary);
+  margin: var(--space-sm) 0;
+}
+.loading-sub {
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin: var(--space-sm) 0 0;
+}
+.progress-track {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-surface-alt);
+  border: 1px solid var(--border-subtle);
+  overflow: hidden;
+}
+.progress-bar {
+  height: 100%;
+  background: var(--color-app-border);
+  box-shadow: 0 0 10px rgba(64, 160, 96, 0.7);
+  transition: width 0.2s ease;
+}
+.spinner {
+  display: inline-block;
+  width: 26px;
+  height: 26px;
+  border: 3px solid var(--border-subtle);
+  border-top-color: var(--color-app-border);
+  border-radius: 50%;
+  animation: fips-spin 0.8s linear infinite;
+}
+.spinner.small {
+  width: 18px;
+  height: 18px;
+  border-width: 2px;
+  margin-bottom: var(--space-sm);
+}
+@keyframes fips-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Detail / node views --------------------------------------------------- */
+.detail-head {
+  gap: var(--space-sm);
+}
+.back-btn {
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  padding: 4px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.back-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--border-medium);
+  background: rgba(255, 255, 255, 0.03);
+}
+.detail-country {
+  font-family: var(--font-mono);
+  font-size: 0.9375rem;
+  color: var(--text-primary);
+  margin-bottom: var(--space-sm);
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.node-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1;
+}
+.node-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border-subtle);
+  transition: background 0.12s ease;
+}
+.node-row:hover {
+  background: rgba(64, 160, 96, 0.1);
+}
+.node-row-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.node-name {
+  font-size: 0.8125rem;
+  color: var(--text-primary);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-ep {
+  font-size: 0.6875rem;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pin-star {
+  color: var(--accent-gold);
+  flex-shrink: 0;
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-app-border);
+  box-shadow: 0 0 8px var(--color-app-border);
+  flex-shrink: 0;
+}
+.dot.off {
+  background: var(--color-transport-border);
+  box-shadow: 0 0 6px var(--color-transport-border);
+}
+
+.node-detail {
+  overflow-y: auto;
+  flex: 1;
+}
+.node-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: var(--space-md);
+}
+.node-title .node-name {
+  font-size: 0.9375rem;
+  white-space: normal;
+}
+.kv {
+  margin: 0;
+  display: grid;
+  grid-template-columns: 92px 1fr;
+  gap: 8px var(--space-md);
+}
+.kv dt {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  padding-top: 2px;
+}
+.kv dd {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: var(--text-primary);
+  min-width: 0;
+}
+.kv dd.wrap .mono {
+  word-break: break-all;
+}
+.kv .mono {
+  font-family: var(--font-mono);
+}
+.kv .small {
+  font-size: 0.6875rem;
+}
+.kv .muted {
+  color: var(--text-muted);
+}
+.ep-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+.copy-btn {
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  padding: 1px 7px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.copy-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--border-medium);
 }
 
 .err {
