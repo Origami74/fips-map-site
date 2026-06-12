@@ -11,12 +11,10 @@ const {
   sinceDays,
   limit,
   showExpired,
-  status,
   errorMsg,
   nowSec,
   peerList,
   liveCount,
-  expiredCount,
   scan,
   selectBranch,
   resetRelays,
@@ -113,12 +111,6 @@ function shortNpub(hex) {
 }
 function peerLabel(peer) {
   return peer.pin?.name || shortNpub(peer.event.pubkey);
-}
-
-function statusPillClass(s) {
-  if (s === "live" || s === "scanning…") return "accent-green";
-  if (s === "error") return "accent-red";
-  return "";
 }
 
 // --- Selection (Vue-driven detail panel) ---------------------------------
@@ -410,20 +402,8 @@ onBeforeUnmount(() => {
                 <span class="pill-v">{{ liveCount }}</span>
               </span>
               <span class="pill">
-                <span class="pill-k">on map</span>
+                <span class="pill-k">known location</span>
                 <span class="pill-v">{{ locatedPeers.length }}</span>
-              </span>
-              <span class="pill">
-                <span class="pill-k">unplaced</span>
-                <span class="pill-v">{{ unlocatedCount }}</span>
-              </span>
-              <span class="pill accent-red">
-                <span class="pill-k">expired</span>
-                <span class="pill-v">{{ expiredCount }}</span>
-              </span>
-              <span class="pill" :class="statusPillClass(status)">
-                <span class="pill-k">status</span>
-                <span class="pill-v">{{ status }}</span>
               </span>
             </div>
           </div>
